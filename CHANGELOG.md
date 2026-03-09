@@ -4,6 +4,11 @@ All notable changes to the "github-copilot-api-vscode" extension will be documen
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [2.10.2] - 2026-03-09
+
+### Fixed
+- Release workflow: explicitly package the VSIX before uploading to GitHub Release, ensuring the release page actually contains the artifact.
+
 ## [2.10.1] - 2026-03-09
 
 ### Fixed
