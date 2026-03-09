@@ -92,10 +92,17 @@ export interface RequestHistoryEntry {
 }
 
 // --- Anthropic API Interfaces ---
+export type AnthropicContentBlock =
+	| { type: 'text'; text: string }
+	| { type: 'tool_use'; id: string; name: string; input: any }
+	| { type: 'tool_result'; tool_use_id: string; content: string | { type: 'text'; text: string }[] };
+
 export interface AnthropicMessageRequest {
 	model: string;
-	messages: { role: 'user' | 'assistant'; content: string | { type: 'text'; text: string }[] }[];
-	system?: string;
+	messages: { role: 'user' | 'assistant'; content: string | AnthropicContentBlock[] }[];
+	system?: string | { type: 'text'; text: string }[];
+	tools?: { name: string; description?: string; input_schema: any }[];
+	tool_choice?: string | { type: string; name?: string } | { type: 'auto' | 'any' | 'tool'; name?: string };
 	max_tokens?: number;
 	stop_sequences?: string[];
 	stream?: boolean;
@@ -1438,7 +1445,11 @@ export class CopilotApiGateway implements vscode.Disposable {
 		// Authentication check (skip for health endpoint)
 		if (this.config.apiKey && url.pathname !== '/health') {
 			const authHeader = req.headers['authorization'];
-			const providedKey = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+			const xApiKey = req.headers['x-api-key'];
+			// Accept both Bearer token (OpenAI style) and x-api-key (Anthropic/Claude Code style)
+			const providedKey = authHeader?.startsWith('Bearer ')
+				? authHeader.slice(7)
+				: (typeof xApiKey === 'string' ? xApiKey : null);
 			if (providedKey !== this.config.apiKey) {
 				this.logRequest(requestId, req.method || 'UNKNOWN', url.pathname, 401, Date.now() - requestStart, {
 					requestHeaders: req.headers
@@ -2025,13 +2036,18 @@ export class CopilotApiGateway implements vscode.Disposable {
 	private async processStreamingAnthropicMessages(payload: AnthropicMessageRequest, req: IncomingMessage, res: ServerResponse, logRequestId?: string, logRequestStart?: number): Promise<void> {
 		const messages: vscode.LanguageModelChatMessage[] = [];
 
-		if (payload.system) {
-			messages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(payload.system)));
+		const systemText = typeof payload.system === 'string'
+			? payload.system
+			: Array.isArray(payload.system)
+				? payload.system.map((b: { text?: string }) => b.text || '').join('\n')
+				: '';
+		if (systemText) {
+			messages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(systemText)));
 		}
 
 		for (const msg of payload.messages) {
 			const role = msg.role === 'user' ? vscode.LanguageModelChatMessageRole.User : vscode.LanguageModelChatMessageRole.Assistant;
-			const content = typeof msg.content === 'string' ? msg.content : msg.content.map(c => c.text).join(' ');
+			const content = this.flattenMessageContent(msg.content);
 			const redactedContent = this.redactPromptString(content);
 
 			if (role === vscode.LanguageModelChatMessageRole.User) {
@@ -2084,7 +2100,23 @@ export class CopilotApiGateway implements vscode.Disposable {
 			if (!lmModel) {
 				throw new ApiError(404, `Model "${resolvedModel}" not found. Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
 			}
-			const response = await lmModel.sendRequest(messages, {}, cts.token);
+
+			// Build request options — pass tools if provided (Anthropic → VS Code LM format)
+			const streamOptions: vscode.LanguageModelChatRequestOptions = {};
+			if (payload.tools && payload.tools.length > 0) {
+				streamOptions.tools = payload.tools.map(t => ({
+					name: t.name,
+					description: t.description || '',
+					inputSchema: t.input_schema
+				}));
+				const tc = payload.tool_choice;
+				const tcType = typeof tc === 'string' ? tc : (tc as any)?.type;
+				streamOptions.toolMode = (tcType === 'any' || tcType === 'tool')
+					? vscode.LanguageModelChatToolMode.Required
+					: vscode.LanguageModelChatToolMode.Auto;
+			}
+
+			const response = await lmModel.sendRequest(messages, streamOptions, cts.token);
 
 			// Anthropic streaming starts with message_start
 			res.write(`event: message_start\ndata: ${JSON.stringify({
@@ -2107,27 +2139,53 @@ export class CopilotApiGateway implements vscode.Disposable {
 				content_block: { type: 'text', text: '' }
 			})}\n\n`);
 
+			let contentBlockIndex = 0;
+			let hasToolCalls = false;
+
 			for await (const part of response.stream) {
 				if (cts.token.isCancellationRequested) { break; }
 				if (part instanceof vscode.LanguageModelTextPart) {
 					totalContent += part.value;
 					res.write(`event: content_block_delta\ndata: ${JSON.stringify({
 						type: 'content_block_delta',
-						index: 0,
+						index: contentBlockIndex,
 						delta: { type: 'text_delta', text: part.value }
 					})}\n\n`);
+				} else if (part instanceof vscode.LanguageModelToolCallPart) {
+					// Close the current text block first (if any)
+					if (!hasToolCalls) {
+						res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: contentBlockIndex })}\n\n`);
+						hasToolCalls = true;
+					}
+					contentBlockIndex++;
+					const toolCallId = `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+					const argsStr = typeof part.input === 'string' ? part.input : JSON.stringify(part.input);
+					res.write(`event: content_block_start\ndata: ${JSON.stringify({
+						type: 'content_block_start',
+						index: contentBlockIndex,
+						content_block: { type: 'tool_use', id: toolCallId, name: part.name, input: {} }
+					})}\n\n`);
+					res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+						type: 'content_block_delta',
+						index: contentBlockIndex,
+						delta: { type: 'input_json_delta', partial_json: argsStr }
+					})}\n\n`);
+					res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: contentBlockIndex })}\n\n`);
 				}
 			}
 
 			if (!cts.token.isCancellationRequested) {
-				res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-					type: 'content_block_stop',
-					index: 0
-				})}\n\n`);
+				// Close the last text block if there were no tool calls
+				if (!hasToolCalls) {
+					res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+						type: 'content_block_stop',
+						index: 0
+					})}\n\n`);
+				}
 
 				res.write(`event: message_delta\ndata: ${JSON.stringify({
 					type: 'message_delta',
-					delta: { stop_reason: 'end_turn', stop_sequence: null },
+					delta: { stop_reason: hasToolCalls ? 'tool_use' : 'end_turn', stop_sequence: null },
 					usage: { output_tokens: 0 }
 				})}\n\n`);
 
@@ -2228,9 +2286,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 			// Convert messages to VS Code format
 			const lmMessages: vscode.LanguageModelChatMessage[] = [];
 			for (const msg of messages) {
-				const content = typeof msg.content === 'string'
-					? msg.content
-					: JSON.stringify(msg.content);
+				const content = this.flattenMessageContent(msg.content);
 
 				switch (msg.role) {
 					case 'system':
@@ -2864,13 +2920,18 @@ export class CopilotApiGateway implements vscode.Disposable {
 	private async processAnthropicMessages(payload: AnthropicMessageRequest): Promise<AnthropicMessageResponse> {
 		const messages: vscode.LanguageModelChatMessage[] = [];
 
-		if (payload.system) {
-			messages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(payload.system)));
+		const systemTextNS = typeof payload.system === 'string'
+			? payload.system
+			: Array.isArray(payload.system)
+				? payload.system.map((b: { text?: string }) => b.text || '').join('\n')
+				: '';
+		if (systemTextNS) {
+			messages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(systemTextNS)));
 		}
 
 		for (const msg of payload.messages) {
 			const role = msg.role === 'user' ? vscode.LanguageModelChatMessageRole.User : vscode.LanguageModelChatMessageRole.Assistant;
-			const content = typeof msg.content === 'string' ? msg.content : msg.content.map(c => c.text).join(' ');
+			const content = this.flattenMessageContent(msg.content);
 			const redactedContent = this.redactPromptString(content);
 
 			if (role === vscode.LanguageModelChatMessageRole.User) {
@@ -2881,14 +2942,6 @@ export class CopilotApiGateway implements vscode.Disposable {
 		}
 
 		const resolvedModel = this.resolveModel(payload.model);
-		const promptStr = messages.map(m => {
-			if (typeof m.content === 'string') { return m.content; }
-			return m.content.map(p => {
-				if ('text' in p) { return p.text; }
-				return '';
-			}).join(' ');
-		}).join('\n');
-
 
 
 		// Use sendRequest directly to preserve message structure instead of flattening to string
@@ -3281,9 +3334,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 		const lmMessages: vscode.LanguageModelChatMessage[] = [];
 
 		for (const msg of chatMessages) {
-			const content = typeof msg.content === 'string'
-				? msg.content
-				: JSON.stringify(msg.content);
+			const content = this.flattenMessageContent(msg.content);
 
 			switch (msg.role) {
 				case 'system':
@@ -3822,8 +3873,23 @@ export class CopilotApiGateway implements vscode.Disposable {
 				if (typeof part === 'string') {
 					return part;
 				}
-				if (part && typeof part === 'object' && typeof (part as Record<string, unknown>).text === 'string') {
-					return String((part as Record<string, unknown>).text);
+				if (part && typeof part === 'object') {
+					const p = part as Record<string, unknown>;
+					// Plain text block: {type:'text', text:'...'}
+					if (typeof p.text === 'string') {
+						return p.text;
+					}
+					// tool_result block: extract nested content
+					if (p.type === 'tool_result') {
+						const c = p.content;
+						if (typeof c === 'string') { return c; }
+						if (Array.isArray(c)) { return c.map((cp: any) => cp.text || '').join('\n'); }
+						return '';
+					}
+					// tool_use block: format as a human-readable call summary
+					if (p.type === 'tool_use') {
+						return `[Tool call: ${p.name}(${typeof p.input === 'string' ? p.input : JSON.stringify(p.input)})]`;
+					}
 				}
 				return '';
 			}).join('\n');
@@ -5058,7 +5124,8 @@ export class CopilotApiGateway implements vscode.Disposable {
 
 	private setCorsHeaders(res: ServerResponse): void {
 		res.setHeader('Access-Control-Allow-Origin', '*');
-		res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, x-requested-with');
+		// Include x-api-key and anthropic-* headers for Claude Code / Anthropic SDK compatibility
+		res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, x-requested-with, x-api-key, anthropic-version, anthropic-beta');
 		res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
 	}
 
