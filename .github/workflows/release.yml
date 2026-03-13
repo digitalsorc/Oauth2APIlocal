@@ -38,8 +38,26 @@ jobs:
         run: npx ovsx publish *.vsix -p ${{ secrets.OVSX_PAT }}
         continue-on-error: true
 
+      - name: Install Standalone Dependencies
+        working-directory: standalone
+        run: npm ci
+
+      - name: Build Standalone App
+        working-directory: standalone
+        run: npm run build:prod
+
+      - name: Package Standalone Executables
+        working-directory: standalone
+        run: npm run package
+
+      - name: List Standalone Binaries
+        working-directory: standalone
+        run: ls -lh bin/
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: "*.vsix"
+          files: |
+            *.vsix
+            standalone/bin/*
           generate_release_notes: true
