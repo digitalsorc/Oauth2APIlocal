@@ -176,6 +176,78 @@ nohup code --disable-workspace-trust &>/dev/null &
 
 > **Note:** VS Code must remain running in the background. If you close VS Code, the gateway stops. The `autoStart` setting ensures the API server starts the moment VS Code opens — no manual clicks needed.
 
+---
+
+## 🚀 Standalone Executable (No VS Code Required)
+
+Want to run the gateway **without VS Code**? The standalone executable provides the same API gateway functionality as a native binary for macOS, Windows, and Linux — no VS Code runtime needed!
+
+### Features
+
+- **Zero Dependencies**: Native executable, no Node.js or VS Code required
+- **Multi-Provider**: GitHub Copilot + Google Gemini Pro support
+- **OpenAI-Compatible API**: Drop-in replacement for OpenAI clients
+- **Cross-Platform**: Single binary for each OS
+- **CLI Interface**: Full command-line configuration
+- **Persistent Config**: Settings saved to `~/.oauth2apilocal/config.json`
+
+### Quick Start
+
+```bash
+# Download the binary for your platform (see releases)
+# macOS/Linux: Make it executable
+chmod +x oauth2apilocal
+
+# Set your Gemini API key
+export GEMINI_API_KEY="your-gemini-api-key"
+
+# Start the server
+./oauth2apilocal --port 1337
+
+# Test it
+curl http://localhost:1337/v1/models
+```
+
+### Building from Source
+
+```bash
+cd standalone
+npm install
+npm run build        # Build TypeScript
+npm run package      # Create binaries (macOS, Windows, Linux)
+```
+
+Binaries will be in `standalone/bin/`.
+
+### Usage
+
+```bash
+# Basic usage
+oauth2apilocal --port 1337 --host 127.0.0.1
+
+# With authentication
+oauth2apilocal --api-key your-secret-key
+
+# Enable only Gemini
+oauth2apilocal --providers gemini --gemini-api-key YOUR_KEY
+
+# Debug mode
+oauth2apilocal --log-level debug
+```
+
+**See the full documentation:** [standalone/README-standalone.md](standalone/README-standalone.md)
+
+### Provider Support
+
+| Provider | Authentication | Models |
+|----------|----------------|--------|
+| **Google Gemini** | `GEMINI_API_KEY` env var | `gemini-pro`, `gemini-1.5-pro`, `gemini-1.5-flash` |
+| **GitHub Copilot** | `GITHUB_TOKEN` env var | `gpt-4o-copilot`, `claude-3.5-sonnet-copilot` |
+
+> **Note:** The standalone executable uses direct API calls instead of VS Code's language model abstraction. GitHub Copilot support requires a valid GitHub token with Copilot access.
+
+---
+
 ## 🔌 API Endpoints
 
 | Endpoint | Method | Description |
